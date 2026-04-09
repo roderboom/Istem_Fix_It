@@ -1,0 +1,37 @@
+# ── FixBot — Python Telegram Bot ─────────────────────────────────────────────
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="FixBot"
+LABEL org.opencontainers.image.description="Telegram repair assistant powered by LLaMA 3.2-Vision"
+
+# System deps for Pillow (font rendering, JPEG support) + Hebrew fonts
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libfreetype6-dev \
+    libjpeg-dev \
+    libpng-dev \
+    zlib1g-dev \
+    fonts-dejavu-core \
+    fonts-liberation \
+    fonts-noto \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY . .
+
+# ── Pre-download Hebrew ↔ English translation models at build time (~200 MB) ──
+# This runs once during `podman-compose build` so the bot starts instantly.
+# Requires internet access during build (not at runtime).
+RUN python download_translation_models.py
+
+# Non-root user for security
+RUN useradd --create-home --shell /bin/bash fixbot \
+    && chown -R fixbot:fixbot /root/.local   # argostranslate stores packages here
+USER fixbot
+
+CMD ["python", "-u", "bot.py"]
