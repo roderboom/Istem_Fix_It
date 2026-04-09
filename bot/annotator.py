@@ -9,7 +9,7 @@ import io
 import logging
 import os
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,9 @@ def annotate_image(image_bytes: bytes, analysis: dict) -> bytes:
     """
     components = analysis.get("components", [])
 
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    img = Image.open(io.BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)  # apply EXIF rotation before placing dots
+    img = img.convert("RGBA")
 
     # Scale up small images so dots look proportional
     min_dim = 700
