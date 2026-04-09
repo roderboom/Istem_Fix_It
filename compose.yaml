@@ -20,7 +20,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - OLLAMA_KEEP_ALIVE=10m
       - OLLAMA_NUM_PARALLEL=1
-      - OLLAMA_CONTEXT_LENGTH=204800
+      - OLLAMA_CONTEXT_LENGTH=8000
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
       interval: 15s
@@ -42,8 +42,6 @@ services:
       - OLLAMA_HOST=http://ollama:11434
       - MODEL_NAME=gemma4:26b
       - HISTORY_DIR=/data/history
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - GOOGLE_CSE_ID=${GOOGLE_CSE_ID}
     volumes:
       - ./bot:/app:ro
       - repair-history:/data/history   # persistent repair history

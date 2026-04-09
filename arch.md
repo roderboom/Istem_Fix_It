@@ -1,86 +1,235 @@
-# 🛠️ FixBot Architecture & Implementation Guide
+# FixBot — Architecture
 
-This document provides a comprehensive overview of the **FixBot** codebase, its architecture, and instructions for modifying or extending the system.
+## Overview
 
-## 🤖 System Overview
-
-FixBot is a Telegram-based AI assistant that analyzes photos of broken items (appliances, plumbing, vehicles, etc.) to provide detailed, localized repair instructions. It leverages a local **Ollama** instance running a vision-language model (e.g., `qwen2.5-vl` or `llama3.2-vision`) to ensure privacy and zero cost.
-
-### 🏗️ High-Level Architecture
-
-The system operates as a pipeline of specialized Python modules:
-
-1.  **Telegram Interface (`bot/bot.py`)**: Man
-    *   Handles Telegram bot interactions (commands, photo uploads, follow-up questions).
-    *   Manages user sessions, language detection (Hebrew/English), and conversation history.
-    *   Orchestrates the entire analysis pipeline.
-2.  **Vision Analysis (`bot/vision.py`)**:
-    *   Communicates with the local **Ollama** API.
-    *   Performs two main tasks:
-        *   `identify_problem`: A fast, low-token pass to identify the object and issue (used for web search queries).
-        *   `analyze_image`: A deep analysis pass that returns a structured JSON object containing severity, tools, materials, steps, and part coordinates.
-3.  **Web Context Injection (`bot/searcher.py`)**:
-    *   Uses **Google Custom Search API** to find real-world repair guides based on the identified problem.
-    *   Provides the LLM with factual "web context" to improve instruction accuracy.
-4.  **Translation Layer (`bot/translator.py`)**:
-    *   Uses the same Ollama instance to translate user captions (Hebrew $\leftrightarrow$ English) and model outputs (English $\to$ Hebrew).
-    *   Handles batch translation of complex JSON structures to maintain efficiency.
-5.  **Image Annotation (`bot/annotator.py`)**:
-    *   Takes the visual coordinates (`grid_col`, `grid_row`) from the AI's JSON output.
-    *   Uses **Pillow** to draw numbered, high-visibility markers on the original image to point out specific parts.
-6.  **Persistence (`bot/history.py`)**:
-    *   Saves completed repair analyses to disk as JSON files, organized by user ID.
+FixBot is a Telegram bot that receives photos of broken items, runs them through a local vision AI model, and returns annotated images with structured repair instructions. Everything runs locally via Podman — no internet connection required at runtime.
 
 ---
 
-## 📂 Project Structure
+## Container Architecture
 
-```text
-.
-├── bot/
-│   ├── annotator.py    # Image marking logic (Pillow)
-│   ├── bot.py          # Main Telegram bot logic & orchestrator
-│   ├── history.py      # JSON-based repair history persistence
-│   ├── searcher.py     # Google Custom Search integration
-│   ├── translator.py   # LLM-powered translation (Heb/Eng)
-│   ├── vision.py       # Ollama API communication & vision prompts
-│   └── requirements.txt# Python dependencies
-├── compose.yaml        # Container orchestration (Bot + Ollama)
-├── .env                # Environment variables (Tokens, API Keys)
-└── README.md           # Setup and usage instructions
+Two containers run via `podman-compose`:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Host Machine (Linux, RTX 5070 Ti 16GB, 94GB RAM)   │
+│                                                     │
+│  ┌─────────────────────┐  ┌──────────────────────┐  │
+│  │   fixbot-ollama     │  │    fixbot-bot        │  │
+│  │                     │  │                      │  │
+│  │  Ollama server      │◄─│  Python 3.12         │  │
+│  │  port 11434         │  │  python-telegram-bot │  │
+│  │  GPU: CDI all       │  │  httpx, Pillow       │  │
+│  │                     │  │                      │  │
+│  │  Volume:            │  │  Volume:             │  │
+│  │  ollama-models      │  │  repair-history      │  │
+│  └─────────────────────┘  └──────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+`fixbot-bot` waits for `fixbot-ollama` to pass its healthcheck before starting. The bot communicates with Ollama over the internal Docker network at `http://ollama:11434`.
+
+---
+
+## Request Flow
+
+### Photo sent by user
+
+```
+User sends photo (+ optional caption)
+        │
+        ▼
+  handle_photo()  [bot.py]
+        │
+        ├── Detect language from caption (Hebrew / English)
+        ├── Album buffering: wait 2.5s for all photos in same media_group_id
+        │
+        ▼
+  _run_analysis()  [bot.py]
+        │
+        ├── Status: "🔍 Analyzing…"
+        │
+        ├── vision.py: analyze_image()
+        │     ├── Resize images (1 photo → 1120px, 2 photos → 896px each)
+        │     ├── Snap dimensions to multiples of 28 (Gemma4 patch grid)
+        │     ├── Base64-encode images
+        │     ├── Build system prompt (language-aware)
+        │     ├── POST /api/chat → Ollama
+        │     ├── Extract JSON from response (_extract_json + _repair_json)
+        │     └── Validate + normalize JSON (_validate)
+        │
+        ├── Status: "🖊️ Marking areas…"
+        │
+        ├── annotator.py: annotate_image()
+        │     ├── Apply EXIF rotation (ImageOps.exif_transpose)
+        │     ├── Scale image if too small
+        │     ├── For each component: convert grid_col/grid_row → x/y pixels
+        │     └── Draw numbered dots (dark outline + white fill + number)
+        │
+        ├── history.py: save_repair()
+        │
+        └── Send annotated photo + formatted text to user
+```
+
+### Text message (follow-up question)
+
+```
+User sends text
+        │
+        ▼
+  handle_text()  [bot.py]
+        │
+        ├── Detect language
+        ├── vision.py: ask_followup()
+        │     └── POST /api/chat with last image + conversation history
+        └── Reply with answer
 ```
 
 ---
 
-## 🛠️ Development & Modification Guide
+## vision.py — Model Interface
 
-### 1. Adding New Capabilities
-*   **New Analysis Steps**: If you want to add a "cost estimation" feature, modify the JSON schema in `bot/vision.py`, update the `_format` function in `bot/bot.py`, and ensure the `translator.py` handles the new field.
-*   **New Communication Channels**: To support Discord or WhatsApp, you would need to replace the `python-telegram-bot` logic in `bot/bot.py` with the respective library, while keeping the `vision.py` and `searcher.py` logic intact.
+### Key functions
 
-### 2. Modifying the AI Behavior
-*   **Prompt Engineering**: All core logic resides in `bot/vision.py` (System Prompts) and `bot/translator.py`.
-*   **Prompt Tuning**: To change how the bot identifies parts, modify the `COMPONENT RULES` section within `bot/vision.py`.
-*   **Model Swapping**: If you upgrade the Ollama model, update `MODEL_NAME` in `bot/vision.py`. Ensure the new model supports the required visual features (like coordinate/grid output).
+**`analyze_image(images, caption, history, lang)`**
+- Primary analysis call. Sends 1-2 images with the repair prompt.
+- Returns a validated dict with `problem_summary`, `severity`, `safety_warnings`, `tools_needed`, `materials_needed`, `components`, `steps`, `professional_advice`.
 
-### 3. Handling Languages
-*   **Language Detection**: Handled automatically in `bot/bot.py` and `bot/vision.py` by checking for Hebrew Unicode ranges.
-*   **Expanding Language Support**: To add Spanish, you must update:
-    1.  `bot/bot.py`: Add Spanish strings to `_status` and `help_command`.
-    2.  `bot/translator.py`: Update the `_translate` logic and prompt instructions.
-    3.  `bot/vision.py`: Update the `_system_prompt` and `_followup_system` to include Spanish instructions and JSON schemas.
+**`ask_followup(images, question, history, lang)`**
+- Conversational follow-up. Sends the last image with full conversation history.
 
-### 4. Image Processing & Performance
-*   **VRAM Management**: `bot/vision.py` includes logic to resize images based on the number of photos sent (to prevent OOM errors on 16GB GPUs). Do not remove the `MAX_IMAGE_SIDE` constraints unless you have significantly more VRAM.
-*   **Annotation Precision**: If the dots are appearing in the wrong place, check the `grid_col`/`grid_row` $\to$ percentage conversion logic in `bot/vision.py` and the `annotate_image` logic in `bot/annotator.py`.
+### Image sizing strategy
 
-### 5. Environment & Deployment
-*   **API Keys**: Never commit `.env`. Always use `.env.example` as a template.
-*   **Docker/Podman**: The project is designed to run in isolated containers. If adding new Python dependencies, ensure you update `bot/requirements.txt` and rebuild the container using `podman-compose build`.
+| Photos sent | Max side | Purpose |
+|-------------|----------|---------|
+| 1 | 1120px | Maximum detail, fits in VRAM |
+| 2 | 896px each | Both fit without OOM |
+| 3+ | 896px, capped at 2 | Prevent VRAM overflow |
+
+All dimensions are snapped to multiples of 28 — this aligns with Gemma4's vision encoder patch size, preventing partial patches at image edges and improving coordinate accuracy.
+
+### JSON schema returned by model
+
+```json
+{
+  "problem_summary": "One sentence describing the problem",
+  "severity": "low|medium|high",
+  "safety_warnings": ["warning 1"],
+  "tools_needed": ["tool 1"],
+  "materials_needed": ["material 1"],
+  "components": [
+    {
+      "id": 1,
+      "name": "Part name",
+      "grid_col": 1-10,
+      "grid_row": 1-10
+    }
+  ],
+  "steps": [
+    {
+      "step": 1,
+      "title": "Step title",
+      "instruction": "Paragraph describing what to do, why, and what to watch out for"
+    }
+  ],
+  "professional_advice": "When to call a professional"
+}
+```
+
+### JSON robustness
+
+Three layers of extraction:
+1. Direct `json.loads()` on the raw response
+2. Strip markdown code fences, retry parse
+3. Regex to find outermost `{...}` block
+4. `_repair_json()` — balances unclosed brackets/braces from truncated responses
+5. Fallback dict with error message if all fail
+
+### Prompt design
+
+- **Language**: system prompt instructs the model to respond in Hebrew or English based on detected user language. Gemma4 handles both natively.
+- **Components vs Steps**: these are fully decoupled. `components` are physical parts visible in the image (each gets a dot). `steps` are repair instructions with no coordinate references.
+- **Grid system**: model outputs `grid_col` + `grid_row` on a 10×10 grid instead of raw percentages. Cell centers map to 5%, 15%, 25%... 95% on each axis. This is more reliable than asking models to estimate raw percentages.
+- **Location description**: model must first describe the part's location in words before setting grid coordinates — forces spatial reasoning before guessing numbers.
+- **CJK sanitizer**: strips any Chinese/Japanese/Korean characters that bleed through from Qwen's training data (not needed for Gemma4 but kept as a safety net).
 
 ---
 
-## ⚠️ Critical Constraints
-*   **JSON Integrity**: The `analyze_image` function relies on a strict JSON response. Any modification to the prompt that breaks the JSON structure will cause the bot to fail.
-*   **Language Purity**: The `_strip_cjk` and `_sanitize_dict` functions in `bot/vision.py` are safety measures to prevent the model from "leaking" Chinese/Japanese/Korean characters when the user expects Hebrew or English.
-*   **Concurrency**: The bot uses `asyncio` to handle multiple users. Avoid blocking the main event loop with heavy synchronous computation; use `run_in_executor` for CPU-bound tasks (like `annotator.py`).
+## annotator.py — Image Annotation
+
+### Dot placement
+
+```
+grid_col (1-10) → x% = (col × 10) - 5
+grid_row (1-10) → y% = (row × 10) - 5
+
+x_pixels = x% / 100 × image_width
+y_pixels = y% / 100 × image_height
+```
+
+### EXIF rotation
+
+Phone cameras store images in raw sensor orientation with an EXIF tag indicating the intended display rotation. Without correction, a portrait photo is stored as landscape pixels — the model sees it correctly rotated but the annotator would place dots on unrotated coordinates.
+
+`ImageOps.exif_transpose()` physically rotates the pixel data to match the display orientation before any coordinate math, ensuring the model's grid coordinates and the actual pixel positions match.
+
+### Dot rendering
+
+Each dot: dark ring (outline) + white filled circle + centered step number. Size scales with image resolution (`W // 55`).
+
+---
+
+## history.py — Repair History
+
+- Stores last 50 repairs per user in `/data/history/<user_id>.json`
+- Mounted as a named Podman volume (`repair-history`) so history persists across container restarts
+- Saved fields: `timestamp`, `problem_summary`, `severity`, `tools_needed`, `professional_advice`
+- `/history` command shows last 10 repairs formatted for Telegram
+
+---
+
+## bot.py — Session Management
+
+### Per-user session state
+
+```python
+{
+  "history":       [],    # last 6 exchanges (role + content)
+  "last_images":   [],    # raw bytes of last analyzed photos
+  "last_analysis": None,  # last analysis dict
+  "album_buffer":  {},    # keyed by media_group_id, holds photos + timer task
+  "lang":          "en",  # detected from user's last message
+}
+```
+
+### Album (multi-photo) handling
+
+Telegram sends album photos as separate messages sharing a `media_group_id`. The bot buffers each photo and schedules a 2.5-second timer. If another photo arrives before the timer fires, it cancels and reschedules. After 2.5 seconds of silence, all buffered photos are sent together for analysis.
+
+### Language detection
+
+`detect_language()` in `vision.py` scans the text for Unicode characters in the Hebrew range (`\u05d0`–`\u05ea`). Any Hebrew character → `lang = "he"`. Updated on every user message so switching languages mid-conversation works.
+
+---
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TELEGRAM_TOKEN` | Yes | — | Bot token from @BotFather |
+| `MODEL_NAME` | No | `gemma4:26b` | Ollama model to use |
+| `OLLAMA_HOST` | No | `http://localhost:11434` | Ollama server URL |
+| `HISTORY_DIR` | No | `/data/history` | Path for repair history JSON files |
+
+---
+
+## Model Recommendations
+
+| Model | VRAM | Speed | Notes |
+|-------|------|-------|-------|
+| `gemma4:26b` | ~18 GB | ~90s | Best quality, MoE: only ~4B active per token |
+| `gemma4:e4b` | ~10 GB | ~30s | Fully fits 16GB, fast, good quality |
+| `qwen2.5vl:32b` | ~21 GB | ~3min | Original model, partially offloads to RAM |
+| `qwen2.5vl:7b` | ~5 GB | ~25s | Fast fallback |
+
+Gemma4 is preferred — better multilingual support (Hebrew/English), stronger JSON instruction following, and the MoE architecture means minimal speed penalty despite the large parameter count.

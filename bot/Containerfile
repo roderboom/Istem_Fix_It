@@ -2,9 +2,11 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="FixBot"
-LABEL org.opencontainers.image.description="Telegram repair assistant powered by LLaMA 3.2-Vision"
+LABEL org.opencontainers.image.description="Telegram repair assistant powered by local vision AI"
 
-# System deps for Pillow (font rendering, JPEG support) + Hebrew fonts
+WORKDIR /app
+
+# System deps for Pillow (font rendering, JPEG support)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfreetype6-dev \
     libjpeg-dev \
@@ -15,8 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -24,14 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
-# ── Pre-download Hebrew ↔ English translation models at build time (~200 MB) ──
-# This runs once during `podman-compose build` so the bot starts instantly.
-# Requires internet access during build (not at runtime).
-RUN python download_translation_models.py
-
 # Non-root user for security
-RUN useradd --create-home --shell /bin/bash fixbot \
-    && chown -R fixbot:fixbot /root/.local   # argostranslate stores packages here
+RUN useradd --create-home --shell /bin/bash fixbot
 USER fixbot
 
 CMD ["python", "-u", "bot.py"]

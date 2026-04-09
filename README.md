@@ -1,75 +1,58 @@
-# 🔧 FixBot — עוזר תיקונים חכם לטלגרם
+# 🔧 FixBot — AI Repair Assistant for Telegram
 
-בוט טלגרם שמנתח תמונות של דברים שבורים ומחזיר הוראות תיקון מפורטות עם סימונים על התמונה.
-**עובד לחלוטין מקומית** — ללא שירותי ענן, ללא עלות, ללא שליחת מידע לאינטרנט.
+A Telegram bot that analyzes photos of broken items and returns step-by-step repair instructions with annotated images. Runs **100% locally** — no cloud services, no API costs, no data leaves your machine.
 
 ---
 
-## 🏗️ ארכיטקטורה
+## Active Files
 
 ```
-משתמש (עברית)
-     │
-     ▼
- [Telegram Bot]
-     │
-     ├─► translator.py  →  עברית ➜ אנגלית  (קלט)
-     │
-     ├─► vision.py      →  Ollama API (LLaMA 3.2-Vision 11B)
-     │
-     ├─► translator.py  →  אנגלית ➜ עברית  (פלט)
-     │
-     └─► annotator.py   →  ציור סימונים על התמונה (Pillow)
-          │
-          ▼
-     משתמש מקבל תמונה מסומנת + הוראות בעברית
+fixbot/
+├── compose.yaml          — Podman Compose: Ollama + bot containers
+├── .env.example          — Environment variable template
+└── bot/
+    ├── Containerfile     — Container image definition
+    ├── requirements.txt  — Python dependencies
+    ├── bot.py            — Telegram handlers, session state, photo/album/text routing
+    ├── vision.py         — Ollama API client, prompts, JSON parsing, image resizing
+    ├── annotator.py      — Draws numbered dots on images (Pillow, EXIF-aware)
+    └── history.py        — Persistent per-user repair history (JSON files)
 ```
 
-שני קונטיינרים ב-Podman:
-- fixbot-ollama  שרת מודל הבינה המלאכותית (GPU)
-- fixbot-bot     בוט הטלגרם (Python)
+**Safe to delete:**
+- `bot/searcher.py` — web search feature (removed)
+- `bot/translator.py` — translation layer (removed, model handles Hebrew natively)
+- `setup.sh` — outdated setup script
 
 ---
 
-## דרישות מערכת
+## System Requirements
 
-| רכיב | דרישה מינימלית | המחשב שלך |
-|------|----------------|-----------|
-| GPU | 8 GB VRAM | RTX 5070 Ti 16 GB |
-| RAM | 16 GB | 94 GB |
-| מערכת הפעלה | Linux | |
-| מנהל התקן NVIDIA | 520+ | |
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU VRAM | 10 GB | 16 GB |
+| RAM | 32 GB | 64 GB+ |
+| OS | Linux | Ubuntu 22.04 / 24.04 |
+| NVIDIA driver | 520+ | latest |
+| Podman | 4.0+ | 4.9+ |
 
 ---
 
-## שלב 1 — התקנת Podman
+## Setup
+
+### 1 — Install Podman
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y podman
+sudo apt-get update && sudo apt-get install -y podman
 ```
 
-בדיקה:
-```bash
-podman --version
-```
-
----
-
-## שלב 2 — התקנת podman-compose
+### 2 — Install podman-compose
 
 ```bash
 pip install podman-compose
 ```
 
-בדיקה:
-```bash
-podman-compose --version
-```
-
----
-
-## שלב 3 — התקנת NVIDIA Container Toolkit
+### 3 — NVIDIA Container Toolkit
 
 ```bash
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
@@ -78,147 +61,93 @@ curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
   | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 
-sudo apt-get update
-sudo apt-get install -y nvidia-container-toolkit
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 ```
 
-בדיקה:
-```bash
-nvidia-ctk --version
-nvidia-smi
-```
-
----
-
-## שלב 4 — הגדרת CDI (גישת GPU לקונטיינרים)
+### 4 — Configure CDI (GPU access for containers)
 
 ```bash
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 
-podman run --rm \
-  --device nvidia.com/gpu=all \
-  --security-opt=label=disable \
-  docker.io/nvidia/cuda:12.3.0-base-ubuntu22.04 \
-  nvidia-smi -L
+# Verify:
+podman run --rm --device nvidia.com/gpu=all --security-opt=label=disable \
+  docker.io/nvidia/cuda:12.3.0-base-ubuntu22.04 nvidia-smi -L
 ```
 
-אם מציג "GPU 0: NVIDIA GeForce RTX 5070 Ti" — הכל תקין.
+### 5 — Create your Telegram bot
 
----
+1. Open Telegram → search `@BotFather`
+2. Send `/newbot` → follow the prompts
+3. Copy the token (`7123456789:AAFxxxxx...`)
 
-## שלב 5 — קבלת טוקן טלגרם
-
-1. פתחו טלגרם וחפשו @BotFather
-2. שלחו /newbot
-3. בחרו שם לבוט
-4. בחרו שם משתמש (חייב להסתיים ב-bot)
-5. שמרו את הטוקן — נראה כך: 7123456789:AAFxxxxx...
-
----
-
-## שלב 6 — הגדרת הפרויקט
+### 6 — Configure environment
 
 ```bash
-tar xzf fixbot.tar.gz
-cd fixbot
 cp .env.example .env
 nano .env
+# Set: TELEGRAM_TOKEN=your_token_here
 ```
 
-שנו את השורה:
-  TELEGRAM_TOKEN=your_telegram_bot_token_here
-ל:
-  TELEGRAM_TOKEN=הטוקן-שלכם-כאן
-
-שמרו: Ctrl+O → Enter → Ctrl+X
-
----
-
-## שלב 7 — בניית הקונטיינרים
+### 7 — Build and start
 
 ```bash
 podman-compose build
-```
-
-הבנייה לוקחת 10-20 דקות בפעם הראשונה.
-מורידה: Python, ספריות, גופנים עבריים, מודלי תרגום (~200 MB).
-
----
-
-## שלב 8 — הורדת מודל הבינה המלאכותית
-
-```bash
 podman-compose up -d ollama
 sleep 15
-podman exec fixbot-ollama ollama pull llama3.2-vision:11b
-```
-
-ההורדה: ~8 GB, לוקחת 5-15 דקות.
-
----
-
-## שלב 9 — הפעלת הבוט
-
-```bash
+podman exec fixbot-ollama ollama pull gemma4:26b
 podman-compose up -d fixbot
 ```
 
-בדיקה:
-```bash
-podman-compose logs -f
-```
-
-אמורים להופיע:
-  fixbot-bot | INFO | FixBot is running...
-
----
-
-## שלב 10 — בדיקה בטלגרם
-
-1. פתחו טלגרם
-2. חפשו את הבוט לפי שם המשתמש שבחרתם
-3. שלחו /start
-4. שלחו תמונה של משהו שבור עם כיתוב בעברית
-
----
-
-## פקודות הבוט
-
-/start  הודעת ברוכים הבאים
-/help   טיפים לצילום טוב
-/reset  מחיקת השיחה והתחלה מחדש
-
----
-
-## פקודות שימושיות
+### 8 — Verify
 
 ```bash
-# לוגים בזמן אמת
-podman-compose logs -f
-
-# עצירת הכל
-podman-compose down
-
-# הפעלה מחדש של הבוט אחרי שינויי קוד
-podman-compose build fixbot && podman-compose up -d fixbot
-
-# בדיקת Ollama
-curl http://localhost:11434/api/tags
+podman-compose logs -f fixbot
+# Should show: INFO | FixBot running…
 ```
 
 ---
 
-## פתרון בעיות
+## Bot Commands
 
-Cannot connect to Ollama:
-  podman ps | grep ollama
-  podman-compose logs ollama
+| Command | Description |
+|---------|-------------|
+| `/start` | Welcome message |
+| `/help` | Tips for good repair photos |
+| `/history` | Last 10 repairs |
+| `/clear_history` | Delete repair history |
+| `/new_conversation` | Clear session and start fresh |
 
-GPU לא נגיש:
-  sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+---
 
-מודל לא נמצא:
-  podman exec fixbot-ollama ollama pull llama3.2-vision:11b
+## Recommended Models (16 GB VRAM)
 
-שגיאת בנייה במודלי תרגום:
-  podman-compose build --no-cache fixbot
+| Model | Download | Speed | Quality |
+|-------|----------|-------|---------|
+| `gemma4:26b` | 18 GB | ~90s | Best |
+| `gemma4:e4b` | 9.6 GB | ~30s | Good |
+| `qwen2.5vl:7b` | 5 GB | ~25s | Good |
+
+Change model in `compose.yaml` → `MODEL_NAME=<model>`.
+
+---
+
+## Useful Commands
+
+```bash
+podman-compose logs -f fixbot              # live logs
+podman-compose restart fixbot              # restart after copying updated files
+podman-compose build fixbot && podman-compose up -d fixbot  # full rebuild
+podman exec fixbot-ollama ollama list      # list downloaded models
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| Bot doesn't respond | `podman-compose logs fixbot` |
+| GPU not accessible | `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` |
+| Model not found | `podman exec fixbot-ollama ollama pull gemma4:26b` |
+| JSON parse / truncated responses | Increase `num_predict` in `vision.py` analyze_image options |
+| Hebrew responses cut off | Hebrew uses 2-4x more tokens — `num_predict` needs to be 3000+ |
