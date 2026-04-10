@@ -16,7 +16,8 @@ fixbot/
     ├── bot.py            — Telegram handlers, session state, photo/album/text routing
     ├── vision.py         — Ollama API client, prompts, JSON parsing, image resizing
     ├── annotator.py      — Draws numbered dots on images (Pillow, EXIF-aware)
-    └── history.py        — Persistent per-user repair history (JSON files)
+    ├── history.py        — Persistent per-user repair history (JSON files)
+    └── whitelist.py      — User whitelist with admin approval flow
 ```
 
 **Safe to delete:**
@@ -111,11 +112,31 @@ podman-compose logs -f fixbot
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Welcome message |
+| `/start` | Welcome message — triggers access request if not approved |
 | `/help` | Tips for good repair photos |
 | `/history` | Last 10 repairs |
 | `/clear_history` | Delete repair history |
 | `/new_conversation` | Clear session and start fresh |
+| `/adduser <id>` | *(admin)* Approve a user |
+| `/removeuser <id>` | *(admin)* Revoke a user |
+| `/listusers` | *(admin)* List all approved users |
+
+---
+
+## Access Control
+
+FixBot uses a whitelist — only approved users can interact with it.
+
+**Setup:** set `ADMIN_USER_ID` in your `.env` (get your ID from `@userinfobot` on Telegram).
+
+**Approval flow:**
+1. A new user sends `/start`
+2. Bot tells them their request was sent, then notifies you (admin) with **✅ Allow** / **❌ Deny** buttons
+3. You tap a button — user is instantly approved or denied and notified
+
+**Pre-approve users** at startup via `ALLOWED_USERS=id1,id2` in `.env`.
+
+The whitelist is stored in `/data/history/whitelist.json` and survives container restarts.
 
 ---
 
@@ -150,4 +171,4 @@ podman exec fixbot-ollama ollama list      # list downloaded models
 | GPU not accessible | `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` |
 | Model not found | `podman exec fixbot-ollama ollama pull gemma4:26b` |
 | JSON parse / truncated responses | Increase `num_predict` in `vision.py` analyze_image options |
-| Hebrew responses cut off | Hebrew uses 2-4x more tokens — `num_predict` needs to be 3000+ |
+| Hebrew responses cut off | Hebrew uses 2-4x more tokens — `num_predict` is set to 6000 in `vision.py` |

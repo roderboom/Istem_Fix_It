@@ -41,12 +41,14 @@ User sends photo (+ optional caption)
         ▼
   handle_photo()  [bot.py]
         │
+        ├── Auth check → reject if not on whitelist
         ├── Detect language from caption (Hebrew / English)
         ├── Album buffering: wait 2.5s for all photos in same media_group_id
         │
         ▼
   _run_analysis()  [bot.py]
         │
+        ├── Acquire _ollama_sem — queues if another request is running
         ├── Status: "🔍 Analyzing…"
         │
         ├── vision.py: analyze_image()
@@ -63,7 +65,7 @@ User sends photo (+ optional caption)
         ├── annotator.py: annotate_image()
         │     ├── Apply EXIF rotation (ImageOps.exif_transpose)
         │     ├── Scale image if too small
-        │     ├── For each component: convert grid_col/grid_row → x/y pixels
+        │     ├── For each component: place dot at point.x/point.y percentages
         │     └── Draw numbered dots (dark outline + white fill + number)
         │
         ├── history.py: save_repair()
@@ -79,6 +81,7 @@ User sends text
         ▼
   handle_text()  [bot.py]
         │
+        ├── Auth check → reject if not on whitelist
         ├── Detect language
         ├── vision.py: ask_followup()
         │     └── POST /api/chat with last image + conversation history
@@ -88,6 +91,10 @@ User sends text
 ---
 
 ## vision.py — Model Interface
+
+### Token budget
+
+`num_predict=6000`, `num_ctx=10240` for the analysis call. Hebrew text tokenises at 2–4× the token rate of English. The prompt enforces brevity (max 12 words per list item, max 25 words per step instruction) to keep total output within budget even for detailed repair guides.
 
 ### Key functions
 
@@ -121,8 +128,7 @@ All dimensions are snapped to multiples of 28 — this aligns with Gemma4's visi
     {
       "id": 1,
       "name": "Part name",
-      "grid_col": 1-10,
-      "grid_row": 1-10
+      "point": { "x": 0-100, "y": 0-100 }
     }
   ],
   "steps": [
@@ -142,15 +148,15 @@ Three layers of extraction:
 1. Direct `json.loads()` on the raw response
 2. Strip markdown code fences, retry parse
 3. Regex to find outermost `{...}` block
-4. `_repair_json()` — balances unclosed brackets/braces from truncated responses
+4. `_repair_json()` — repairs truncated responses: closes any unterminated string literal first, then balances unclosed brackets and braces
 5. Fallback dict with error message if all fail
 
 ### Prompt design
 
 - **Language**: system prompt instructs the model to respond in Hebrew or English based on detected user language. Gemma4 handles both natively.
 - **Components vs Steps**: these are fully decoupled. `components` are physical parts visible in the image (each gets a dot). `steps` are repair instructions with no coordinate references.
-- **Grid system**: model outputs `grid_col` + `grid_row` on a 10×10 grid instead of raw percentages. Cell centers map to 5%, 15%, 25%... 95% on each axis. This is more reliable than asking models to estimate raw percentages.
-- **Location description**: model must first describe the part's location in words before setting grid coordinates — forces spatial reasoning before guessing numbers.
+- **Coordinate system**: model outputs direct `x/y` percentages (0–100) for each component. x=0 is the left edge, x=100 is the right edge. A 10×10 grid was tried but caused visible offsets due to coarse 10% snapping. Gemma4's spatial reasoning handles free-form percentages well.
+- **Caption priority**: the user's caption is placed at the start of the user message before the analysis instruction. A `PRIORITY` rule in the prompt instructs the model to annotate exactly the parts named in the caption when specified.
 - **CJK sanitizer**: strips any Chinese/Japanese/Korean characters that bleed through from Qwen's training data (not needed for Gemma4 but kept as a safety net).
 
 ---
@@ -160,11 +166,8 @@ Three layers of extraction:
 ### Dot placement
 
 ```
-grid_col (1-10) → x% = (col × 10) - 5
-grid_row (1-10) → y% = (row × 10) - 5
-
-x_pixels = x% / 100 × image_width
-y_pixels = y% / 100 × image_height
+x_pixels = point.x / 100 × image_width
+y_pixels = point.y / 100 × image_height
 ```
 
 ### EXIF rotation
@@ -202,6 +205,12 @@ Each dot: dark ring (outline) + white filled circle + centered step number. Size
 }
 ```
 
+### Global queue
+
+`_ollama_sem = asyncio.Semaphore(1)` — ensures only one Ollama call runs at a time. Multiple users can send photos simultaneously; the bot processes one and shows the others "⏳ In queue, please wait…". The semaphore is acquired inside `_run_analysis()` and released automatically when analysis completes, even on error.
+
+`_queue_waiters` is a counter incremented when a request starts waiting and decremented when it acquires the semaphore.
+
 ### Album (multi-photo) handling
 
 Telegram sends album photos as separate messages sharing a `media_group_id`. The bot buffers each photo and schedules a 2.5-second timer. If another photo arrives before the timer fires, it cancels and reschedules. After 2.5 seconds of silence, all buffered photos are sent together for analysis.
@@ -212,14 +221,51 @@ Telegram sends album photos as separate messages sharing a `media_group_id`. The
 
 ---
 
+## whitelist.py — Access Control
+
+Stores the set of allowed user IDs in `/data/history/whitelist.json` (same persistent volume as repair history). Loaded on import — seeded from the `ALLOWED_USERS` env var, then merged with the saved JSON file.
+
+### Approval flow
+
+```
+New user sends /start
+        │
+        ├── Not on whitelist → add to _pending_approval set
+        ├── Send user: "request sent, please wait"
+        └── Send admin: approval message with [✅ Allow] [❌ Deny] buttons
+                │
+                ▼
+        Admin taps Allow
+                │
+                ├── wl.add_user(uid) → saved to whitelist.json
+                ├── Admin message edits to "✅ approved"
+                └── User notified: "✅ Access approved, send /start"
+```
+
+The `_pending_approval` set lives in memory — it prevents duplicate admin notifications if the user sends multiple messages while waiting. It does not persist across restarts (intentional — user just sends `/start` again).
+
+### Admin commands
+
+| Command | Description |
+|---------|-------------|
+| `/adduser <id>` | Approve a user directly |
+| `/removeuser <id>` | Revoke access (cannot remove admin) |
+| `/listusers` | List all approved users |
+
+All commands are gated — non-admins get a 🚫 rejection.
+
+---
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TELEGRAM_TOKEN` | Yes | — | Bot token from @BotFather |
+| `ADMIN_USER_ID` | Yes | — | Your Telegram user ID — grants admin access and receives approval requests |
+| `ALLOWED_USERS` | No | — | Comma-separated user IDs to pre-approve at startup |
 | `MODEL_NAME` | No | `gemma4:26b` | Ollama model to use |
 | `OLLAMA_HOST` | No | `http://localhost:11434` | Ollama server URL |
-| `HISTORY_DIR` | No | `/data/history` | Path for repair history JSON files |
+| `HISTORY_DIR` | No | `/data/history` | Path for repair history and whitelist JSON files |
 
 ---
 
