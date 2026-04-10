@@ -144,6 +144,7 @@ CRITICAL JSON RULES — YOU MUST FOLLOW THESE:
 - Every list MUST use square brackets: ["item1", "item2"]
 - You MUST close every opened bracket and brace before stopping
 - The very last character of your response must be a closing brace
+- Keep ALL string values SHORT: max 12 words per warning/tool/material, max 25 words per step instruction
 - If you are running out of space, shorten your text — never leave JSON unclosed"""
 
 
@@ -277,11 +278,15 @@ def _call_ollama(payload: dict) -> dict:
 
 
 def _repair_json(text: str) -> str:
-    """Attempt to close an incomplete JSON object by balancing brackets."""
-    # Count unclosed braces and brackets
+    """
+    Attempt to repair truncated JSON by:
+    1. Closing any unterminated string literal
+    2. Closing any unclosed brackets/braces in reverse order
+    """
     stack = []
     in_string = False
     escape_next = False
+
     for ch in text:
         if escape_next:
             escape_next = False
@@ -301,9 +306,13 @@ def _repair_json(text: str) -> str:
         elif ch == ']' and stack and stack[-1] == '[':
             stack.pop()
 
-    # Close any unclosed structures in reverse order
+    repair = ""
+    # If we ended mid-string, close it first
+    if in_string:
+        repair += '"'
+    # Then close any unclosed structures
     closing = {'[': ']', '{': '}'}
-    repair = ''.join(closing[c] for c in reversed(stack))
+    repair += ''.join(closing[c] for c in reversed(stack))
     return text + repair
 
 
@@ -448,7 +457,7 @@ def analyze_image(
         "model":    MODEL_NAME,
         "messages": messages,
         "stream":   False,
-        "options":  {"temperature": 0.1, "num_predict": 4096, "num_ctx": 8192},
+        "options":  {"temperature": 0.1, "num_predict": 6000, "num_ctx": 10240},
     }
 
     logger.info(f"Calling Ollama ({MODEL_NAME})…")

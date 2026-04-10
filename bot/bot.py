@@ -19,8 +19,18 @@ from telegram.ext import (
 )
 
 from vision import analyze_image, ask_followup, detect_language
+import whitelist as wl
 from annotator import annotate_image
 from history import save_repair, get_history_text, clear_history
+
+# Global queue — one Ollama call at a time
+# Users who sent /start and are waiting for admin approval
+_pending_approval: set[int] = set()
+APPROVE_CB = "approve"
+DENY_CB    = "deny"
+
+_ollama_sem     = asyncio.Semaphore(1)
+_queue_waiters  = 0   # number of requests currently waiting
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -44,6 +54,12 @@ NEW_CONV_CB = "new_conversation"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _unauthorized(uid: int) -> str:
+    if uid in _pending_approval:
+        return "⏳ Your request has been sent to the admin. Please wait for approval."
+    return "🚫 You are not authorized to use this bot."
+
 
 def _kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
@@ -146,6 +162,37 @@ def _status(key: str, lang: str) -> str:
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    user = update.effective_user
+
+    if not wl.is_allowed(uid):
+        # Notify admin with approve/deny buttons
+        if wl.ADMIN_USER_ID and uid not in _pending_approval:
+            _pending_approval.add(uid)
+            name     = user.full_name or "Unknown"
+            username = f" (@{user.username})" if user.username else ""
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Allow",  callback_data=f"{APPROVE_CB}:{uid}"),
+                InlineKeyboardButton("❌ Deny",   callback_data=f"{DENY_CB}:{uid}"),
+            ]])
+            try:
+                await context.bot.send_message(
+                    chat_id=wl.ADMIN_USER_ID,
+                    text=f"🔔 *Access request*\n\n"
+                         f"Name: {name}{username}\n"
+                         f"ID: `{uid}`\n\n"
+                         f"Allow this user?",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                logger.warning(f"Could not notify admin: {e}")
+        await update.message.reply_text(
+            "👋 Hi! Your access request has been sent to the admin.\n"
+            "You will be notified here once approved."
+        )
+        return
+
     await update.message.reply_text(
         "👋 *FixBot*\n\n"
         "🇮🇱 שלחו תמונה של פריט פגום ואני אאבחן ואתן הוראות תיקון.\n"
@@ -156,6 +203,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    if not wl.is_allowed(uid):
+        await update.message.reply_text(_unauthorized(uid))
+        return
     lang = user_sessions[update.effective_user.id]["lang"]
     if lang == "he":
         text = (
@@ -180,12 +231,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid  = update.effective_user.id
+    if not wl.is_allowed(uid):
+        await update.message.reply_text(_unauthorized(uid))
+        return
     lang = user_sessions[uid]["lang"]
     await update.message.reply_text(get_history_text(uid, lang), parse_mode=ParseMode.MARKDOWN)
 
 
 async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid   = update.effective_user.id
+    if not wl.is_allowed(uid):
+        await update.message.reply_text(_unauthorized(uid))
+        return
     lang  = user_sessions[uid]["lang"]
     count = clear_history(uid)
     if lang == "he":
@@ -196,6 +253,10 @@ async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def new_conversation_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    if not wl.is_allowed(uid):
+        await update.message.reply_text(_unauthorized(uid))
+        return
     lang = user_sessions[update.effective_user.id]["lang"]
     _clear_session(update.effective_user.id)
     await update.message.reply_text(_status("cleared", lang), parse_mode=ParseMode.MARKDOWN)
@@ -213,6 +274,109 @@ async def new_conversation_callback(update: Update, context: ContextTypes.DEFAUL
     await query.message.reply_text(_status("cleared", lang))
 
 
+# ── Approval callback ───────────────────────────────────────────────────────
+
+async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query    = update.callback_query
+    admin_id = query.from_user.id
+    await query.answer()
+
+    if not wl.is_admin(admin_id):
+        return
+
+    action, target_str = query.data.split(":", 1)
+    target = int(target_str)
+
+    if action == APPROVE_CB:
+        wl.add_user(target)
+        _pending_approval.discard(target)
+        # Edit the admin message to confirm
+        await query.edit_message_text(
+            f"✅ User `{target}` approved.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text="✅ Your access has been approved! Send /start to begin.",
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify user {target}: {e}")
+
+    elif action == DENY_CB:
+        _pending_approval.discard(target)
+        await query.edit_message_text(
+            f"❌ User `{target}` denied.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text="❌ Your access request was not approved.",
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify user {target}: {e}")
+
+
+# ── Admin commands ──────────────────────────────────────────────────────────
+
+async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if not wl.is_admin(uid):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /adduser <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+    added = wl.add_user(target)
+    msg = f"✅ User {target} added." if added else f"ℹ️ User {target} already allowed."
+    await update.message.reply_text(msg)
+
+
+async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if not wl.is_admin(uid):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removeuser <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+    removed = wl.remove_user(target)
+    if not removed and target == wl.ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Cannot remove the admin.")
+    elif removed:
+        await update.message.reply_text(f"✅ User {target} removed.")
+    else:
+        await update.message.reply_text(f"ℹ️ User {target} was not in the list.")
+
+
+async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if not wl.is_admin(uid):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+    users = wl.list_users()
+    if not users:
+        await update.message.reply_text("No users in whitelist.")
+        return
+    lines = [f"👥 *Allowed users* ({len(users)}):"]
+    for u in users:
+        tag = " _(admin)_" if u == wl.ADMIN_USER_ID else ""
+        lines.append(f"• `{u}`{tag}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 # ── Core analysis pipeline ────────────────────────────────────────────────────
 
 async def _run_analysis(
@@ -225,18 +389,40 @@ async def _run_analysis(
     session = user_sessions[uid]
     lang    = session["lang"]
 
-    status_msg = await update.message.reply_text(_status("analyzing", lang))
+    global _queue_waiters
 
-    try:
-        await status_msg.edit_text(_status("diagnosing", lang))
-        analysis = await asyncio.get_event_loop().run_in_executor(
-            None, analyze_image, image_bytes_list, caption, session["history"], lang
-        )
-    except Exception as e:
-        logger.error(f"Vision analysis failed: {e}")
-        await status_msg.edit_text(_status("model_error", lang) + f"\n`{str(e)[:150]}`",
-                                   parse_mode=ParseMode.MARKDOWN)
-        return
+    # Show queue position if others are waiting
+    if _ollama_sem.locked():
+        _queue_waiters += 1
+        pos = _queue_waiters
+        queue_msg = ("⏳ בתור לעיבוד..." if lang == "he" else f"⏳ In queue, please wait...")
+        status_msg = await update.message.reply_text(queue_msg)
+        async with _ollama_sem:
+            _queue_waiters -= 1
+            await status_msg.edit_text(_status("analyzing", lang))
+            try:
+                await status_msg.edit_text(_status("diagnosing", lang))
+                analysis = await asyncio.get_event_loop().run_in_executor(
+                    None, analyze_image, image_bytes_list, caption, session["history"], lang
+                )
+            except Exception as e:
+                logger.error(f"Vision analysis failed: {e}")
+                await status_msg.edit_text(_status("model_error", lang) + f"\n`{str(e)[:150]}`",
+                                           parse_mode=ParseMode.MARKDOWN)
+                return
+    else:
+        status_msg = await update.message.reply_text(_status("analyzing", lang))
+        async with _ollama_sem:
+            try:
+                await status_msg.edit_text(_status("diagnosing", lang))
+                analysis = await asyncio.get_event_loop().run_in_executor(
+                    None, analyze_image, image_bytes_list, caption, session["history"], lang
+                )
+            except Exception as e:
+                logger.error(f"Vision analysis failed: {e}")
+                await status_msg.edit_text(_status("model_error", lang) + f"\n`{str(e)[:150]}`",
+                                           parse_mode=ParseMode.MARKDOWN)
+                return
 
 
 
@@ -313,6 +499,9 @@ async def _flush_album(
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid     = update.effective_user.id
+    if not wl.is_allowed(uid):
+        await update.message.reply_text(_unauthorized(uid))
+        return
     session = user_sessions[uid]
 
     # Detect language from caption if present
@@ -355,6 +544,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid      = update.effective_user.id
+    if not wl.is_allowed(uid):
+        await update.message.reply_text(_unauthorized(uid))
+        return
     session  = user_sessions[uid]
     question = update.message.text.strip()
 
@@ -402,7 +594,11 @@ def main() -> None:
     app.add_handler(CommandHandler("history",          history_command))
     app.add_handler(CommandHandler("clear_history",    clear_history_command))
     app.add_handler(CommandHandler("new_conversation", new_conversation_command))
+    app.add_handler(CommandHandler("adduser",          adduser_command))
+    app.add_handler(CommandHandler("removeuser",       removeuser_command))
+    app.add_handler(CommandHandler("listusers",        listusers_command))
     app.add_handler(CallbackQueryHandler(new_conversation_callback, pattern=f"^{NEW_CONV_CB}$"))
+    app.add_handler(CallbackQueryHandler(approval_callback, pattern=f"^({APPROVE_CB}|{DENY_CB}):"))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
