@@ -55,8 +55,7 @@ def _system_prompt(lang: str) -> str:
     {
       "id": 1,
       "name": "שם החלק הפיזי בעברית (לדוגמה: ברז ניקוז, בורג ידית)",
-      "grid_col": 1-10,
-      "grid_row": 1-10
+      "point": { "x": 0-100, "y": 0-100 }
     }
   ],
   "steps": [
@@ -86,8 +85,7 @@ def _system_prompt(lang: str) -> str:
     {
       "id": 1,
       "name": "Name of the physical part (e.g. Drain valve, Handle screw)",
-      "grid_col": 1-10,
-      "grid_row": 1-10
+      "point": { "x": 0-100, "y": 0-100 }
     }
   ],
   "steps": [
@@ -112,25 +110,21 @@ JSON schema:
 {schema}
 
 COMPONENT RULES (for the dots on the image):
-- Components are the PHYSICAL PARTS the user will need to touch, move, or use during the repair
+- Components are the PHYSICAL PARTS that dots will be placed on in the image
+- PRIORITY: If the user's description mentions specific parts or areas (e.g. "the green grips", "the left hinge", "the cracked screen"), annotate EXACTLY those parts — find them visually and mark them
+- If no specific parts are mentioned, annotate the most critical parts relevant to the repair
 - Only include parts you can CLEARLY SEE in the image — if you are not certain a part is visible, do NOT include it
-- 1-2 components maximum — only the most critical parts
-- Use the 10×10 grid below to specify location. grid_col and grid_row are integers 1-10:
-
-    col:  1    2    3    4    5    6    7    8    9    10
-         ←————————————————LEFT to RIGHT————————————————→
-    row:  1=TOP  ...  5=UPPER-CENTER  ...  10=BOTTOM
-
-  Examples:
-    Top-left corner of image      → grid_col=1,  grid_row=1
-    Top-right corner              → grid_col=10, grid_row=1
-    Dead center of image          → grid_col=5,  grid_row=5
-    Bottom-center                 → grid_col=5,  grid_row=10
-    Left edge, vertically middle  → grid_col=1,  grid_row=5
-    Upper-right quadrant center   → grid_col=8,  grid_row=3
-    Lower-left quadrant center    → grid_col=3,  grid_row=8
-
-  Be precise — if the part is at 1/3 from the left, use col=3. If it is 3/4 down, use row=7.
+- 1-2 components maximum
+- Use x/y percentages (0-100) where x=0 is the LEFT edge, x=100 is the RIGHT edge, y=0 is the TOP, y=100 is the BOTTOM
+- Estimate the EXACT CENTER of the part in the image:
+    Left third of image     → x ≈ 17-33
+    Center of image         → x ≈ 50
+    Right third of image    → x ≈ 67-83
+    Top quarter             → y ≈ 12-25
+    Middle vertically       → y ≈ 50
+    Bottom quarter          → y ≈ 75-88
+- Be precise: a part at 2/5 from left → x=40, a part at 3/4 down → y=75
+- Point to the EXACT CENTER of the visible part — center of a screw head, center of a grip cap, center of a valve
 
 STEP RULES:
 - Steps are independent of the dots — do NOT say "see dot 1" or reference components by number
@@ -371,14 +365,12 @@ def _validate(analysis: dict, lang: str) -> dict:
             continue
         c.setdefault("id",   i + 1)
         c.setdefault("name", f"{fb['component_name']} {i + 1}")
-        # Convert grid_col/grid_row (1-5) to x/y percentages
-        # Cell centers: col 1→10%, 2→30%, 3→50%, 4→70%, 5→90%
-        col = max(1, min(10, int(c.get("grid_col", 5))))
-        row = max(1, min(10, int(c.get("grid_row", 5))))
-        # 10 cells → centers at 5, 15, 25, 35, 45, 55, 65, 75, 85, 95
+        pt = c.get("point", {})
+        if not isinstance(pt, dict):
+            pt = {}
         c["point"] = {
-            "x": (col * 10) - 5,   # col 1→5%, 2→15%, ... 10→95%
-            "y": (row * 10) - 5,   # row 1→5%, 2→15%, ... 10→95%
+            "x": max(1.0, min(99.0, float(pt.get("x", 50)))),
+            "y": max(1.0, min(99.0, float(pt.get("y", 50)))),
         }
         valid_components.append(c)
     analysis["components"] = valid_components[:2]   # hard cap at 2
@@ -432,13 +424,14 @@ def analyze_image(
         logger.info(f"1 image resized to {MAX_IMAGE_SIDE}px")
 
     if lang == "he":
-        user_content = "נתח את התמונה וזהה מה צריך לתקן. החזר JSON בדיוק לפי הסכמה. כל הטקסט חייב להיות בעברית בלבד — ללא תווים סיניים, יפניים, קוריאניים."
+        user_content = (
+            f"המשתמש מדווח: {user_caption}\n" if user_caption else ""
+        ) + "נתח את התמונה וזהה מה צריך לתקן. החזר JSON בדיוק לפי הסכמה. כל הטקסט חייב להיות בעברית בלבד — ללא תווים סיניים, יפניים, קוריאניים."
     else:
-        user_content = "Analyze the image and identify what needs to be repaired. Return JSON exactly per the schema. All text must be in English only — no Chinese, Japanese, or Korean characters."
+        user_content = (
+            f"User says: {user_caption}\n" if user_caption else ""
+        ) + "Analyze the image and identify what needs to be repaired. Return JSON exactly per the schema. All text must be in English only — no Chinese, Japanese, or Korean characters."
 
-    if user_caption:
-        label = "תיאור המשתמש" if lang == "he" else "User description"
-        user_content += f"\n{label}: {user_caption}"
     if len(resized) > 1:
         user_content += f"\n{len(resized)} {'תמונות — נתח אותן יחד' if lang == 'he' else 'photos — analyze them together'}."
 
