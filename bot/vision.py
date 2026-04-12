@@ -54,8 +54,18 @@ def _system_prompt(lang: str) -> str:
   "components": [
     {
       "id": 1,
-      "name": "שם החלק הפיזי בעברית (לדוגמה: ברז ניקוז, בורג ידית)",
+      "photo": 1,
+      "name": "שם החלק הפיזי (לדוגמה: ברז ניקוז, בורג)",
       "point": { "x": 0-100, "y": 0-100 }
+    }
+  ],
+  "areas": [
+    {
+      "id": 1,
+      "photo": 1,
+      "name": "שם האזור (לדוגמה: אזור שחוק, אזור נזק)",
+      "x1": 0-100, "y1": 0-100,
+      "x2": 0-100, "y2": 0-100
     }
   ],
   "steps": [
@@ -84,8 +94,18 @@ def _system_prompt(lang: str) -> str:
   "components": [
     {
       "id": 1,
+      "photo": 1,
       "name": "Name of the physical part (e.g. Drain valve, Handle screw)",
       "point": { "x": 0-100, "y": 0-100 }
+    }
+  ],
+  "areas": [
+    {
+      "id": 1,
+      "photo": 1,
+      "name": "Area name (e.g. Worn area, Damaged zone)",
+      "x1": 0-100, "y1": 0-100,
+      "x2": 0-100, "y2": 0-100
     }
   ],
   "steps": [
@@ -109,22 +129,32 @@ CRITICAL: Respond ONLY with valid JSON. No text before or after. No markdown cod
 JSON schema:
 {schema}
 
-COMPONENT RULES (for the dots on the image):
-- Components are the PHYSICAL PARTS that dots will be placed on in the image
-- PRIORITY: If the user's description mentions specific parts or areas (e.g. "the green grips", "the left hinge", "the cracked screen"), annotate EXACTLY those parts — find them visually and mark them
-- If no specific parts are mentioned, annotate the most critical parts relevant to the repair
-- Only include parts you can CLEARLY SEE in the image — if you are not certain a part is visible, do NOT include it
-- 1-2 components maximum
-- Use x/y percentages (0-100) where x=0 is the LEFT edge, x=100 is the RIGHT edge, y=0 is the TOP, y=100 is the BOTTOM
-- Estimate the EXACT CENTER of the part in the image:
-    Left third of image     → x ≈ 17-33
-    Center of image         → x ≈ 50
-    Right third of image    → x ≈ 67-83
-    Top quarter             → y ≈ 12-25
-    Middle vertically       → y ≈ 50
-    Bottom quarter          → y ≈ 75-88
-- Be precise: a part at 2/5 from left → x=40, a part at 3/4 down → y=75
-- Point to the EXACT CENTER of the visible part — center of a screw head, center of a grip cap, center of a valve
+ANNOTATION RULES (dots and boxes drawn on the image):
+- PRIORITY: If the user's caption mentions specific parts or areas, annotate EXACTLY those
+- If not specified, choose the most critical visible parts/areas for the repair
+- Only annotate things clearly visible — never guess
+- Total annotations (components + areas combined): 1 to 6
+- MULTI-PHOTO: Each annotation has a "photo" field. Set photo=1 for the first image, photo=2 for the second, etc.
+  Annotations from different photos are drawn on their respective images. Distribute across photos as needed.
+
+CHOOSING ANNOTATION TYPE — this is important:
+  Use a COMPONENT (dot) when: the thing to mark is a SMALL SPECIFIC POINT
+    Examples: a screw head, a button, a hinge pin, a connector port, a broken tooth on a gear
+  Use an AREA (box) when: the thing to mark covers a REGION or ZONE
+    Examples: a corroded patch, a worn rubber surface, a cracked panel section, a dirty filter area,
+              a stripped thread zone, a burnt area on a circuit board, a torn seal region
+  RULE: If the damage or relevant feature spans more than ~10% of the image width or height — USE AN AREA
+  RULE: If it's a surface condition (rust, wear, burn, crack spread, discoloration) — USE AN AREA
+  RULE: If it's a single discrete part you'd grab with two fingers — USE A COMPONENT
+
+COORDINATES (all values 0-100, where 0=left/top, 100=right/bottom):
+- COMPONENT point = EXACT CENTER of the part
+    Left third of photo → x ≈ 17-33  |  Center → x ≈ 50  |  Right third → x ≈ 67-83
+    Top quarter → y ≈ 12-25  |  Middle → y ≈ 50  |  Bottom quarter → y ≈ 75-88
+    Precise: part at 2/5 from left → x=40, part 3/4 down → y=75
+- AREA x1,y1 = top-left corner of box  |  x2,y2 = bottom-right corner
+    Box must tightly wrap the damaged region — not the whole image
+    Example: corrosion patch in top-right corner → x1=65, y1=5, x2=95, y2=35
 
 STEP RULES:
 - Steps are independent of the dots — do NOT say "see dot 1" or reference components by number
@@ -361,19 +391,22 @@ def _validate(analysis: dict, lang: str) -> dict:
     analysis.setdefault("tools_needed",        [])
     analysis.setdefault("materials_needed",    [])
     analysis.setdefault("components",          [])
+    analysis.setdefault("areas",               [])
     analysis.setdefault("steps",               [])
     analysis.setdefault("professional_advice", fb["professional_advice"])
 
     if analysis["severity"] not in ("low", "medium", "high"):
         analysis["severity"] = "medium"
 
-    # Validate components (dots) — convert 5×5 grid → percentage coordinates
+    # Validate components (dots)
     valid_components = []
     for i, c in enumerate(analysis["components"]):
         if not isinstance(c, dict):
             continue
         c.setdefault("id",   i + 1)
+        c.setdefault("photo", 1)
         c.setdefault("name", f"{fb['component_name']} {i + 1}")
+        c["photo"] = max(1, int(c["photo"]))
         pt = c.get("point", {})
         if not isinstance(pt, dict):
             pt = {}
@@ -382,7 +415,33 @@ def _validate(analysis: dict, lang: str) -> dict:
             "y": max(1.0, min(99.0, float(pt.get("y", 50)))),
         }
         valid_components.append(c)
-    analysis["components"] = valid_components[:2]   # hard cap at 2
+
+    # Validate areas (semi-transparent boxes)
+    valid_areas = []
+    for i, a in enumerate(analysis.get("areas", [])):
+        if not isinstance(a, dict):
+            continue
+        a.setdefault("id",   i + 1)
+        a.setdefault("photo", 1)
+        a["photo"] = max(1, int(a["photo"]))
+        a.setdefault("name", f"{fb['component_name']} {i + 1}")
+        a["x1"] = max(0.0,  min(98.0, float(a.get("x1", 20))))
+        a["y1"] = max(0.0,  min(98.0, float(a.get("y1", 20))))
+        a["x2"] = max(1.0,  min(100.0, float(a.get("x2", 80))))
+        a["y2"] = max(1.0,  min(100.0, float(a.get("y2", 80))))
+        if a["x1"] >= a["x2"]: a["x1"] = max(0.0, a["x2"] - 5)
+        if a["y1"] >= a["y2"]: a["y1"] = max(0.0, a["y2"] - 5)
+        valid_areas.append(a)
+
+    # Enforce combined cap of 6
+    excess = (len(valid_components) + len(valid_areas)) - 6
+    if excess > 0:
+        valid_areas      = valid_areas[:max(0, len(valid_areas) - excess)]
+        remaining_excess = (len(valid_components) + len(valid_areas)) - 6
+        if remaining_excess > 0:
+            valid_components = valid_components[:len(valid_components) - remaining_excess]
+    analysis["components"] = valid_components
+    analysis["areas"]      = valid_areas
 
     # Validate steps
     valid_steps = []
@@ -442,7 +501,10 @@ def analyze_image(
         ) + "Analyze the image and identify what needs to be repaired. Return JSON exactly per the schema. All text must be in English only — no Chinese, Japanese, or Korean characters."
 
     if len(resized) > 1:
-        user_content += f"\n{len(resized)} {'תמונות — נתח אותן יחד' if lang == 'he' else 'photos — analyze them together'}."
+        if lang == "he":
+            user_content += f"\n{len(resized)} תמונות. תמונה 1 היא הראשונה, תמונה 2 היא השנייה. בשדה photo של כל סימון, ציין לאיזו תמונה הוא שייך (1 או 2)."
+        else:
+            user_content += f"\n{len(resized)} photos provided. Photo 1 is the first image, photo 2 is the second. In the photo field of each annotation, specify which photo it belongs to (1 or 2)."
 
     messages = [{"role": "system", "content": _system_prompt(lang)}]
     for msg in history[-4:]:
@@ -471,7 +533,7 @@ def analyze_image(
         parsed = {
             "problem_summary": fb["parse_error"],
             "severity": "medium", "safety_warnings": [], "tools_needed": [],
-            "materials_needed": [], "components": [], "steps": [],
+            "materials_needed": [], "components": [], "areas": [], "steps": [],
             "professional_advice": raw[:400],
         }
     return _validate(parsed, lang)

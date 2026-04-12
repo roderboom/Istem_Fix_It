@@ -112,12 +112,16 @@ def _format(analysis: dict, lang: str) -> str:
     if tools or materials:
         lines.append("")
 
-    # Components (what the dots point to)
+    # Components (dots) and areas (boxes)
     components = analysis.get("components", [])
-    if components:
-        lines.append(f"📍 *{'חלקים בתמונה' if lang == 'he' else 'Parts in image'}*")
+    areas      = analysis.get("areas", [])
+    if components or areas:
+        label = "📍 *סימונים בתמונה*" if lang == "he" else "📍 *Annotations in image*"
+        lines.append(label)
         for c in components:
-            lines.append(f"  {c.get('id', '?')}. {c.get('name', '')}")
+            lines.append(f"  🔴 {c.get('id', '?')}. {c.get('name', '')}")
+        for a in areas:
+            lines.append(f"  🟦 {a.get('id', '?')}. {a.get('name', '')}")
         lines.append("")
 
     # Repair steps
@@ -193,11 +197,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    is_admin = wl.is_admin(uid)
+    if is_admin:
+        commands = (
+            "📸 Send a photo to start a repair diagnosis\n\n"
+            "*Commands:*\n"
+            "/help — tips for good photos\n"
+            "/history — your last 10 repairs\n"
+            "/clear\\_history — delete repair history\n"
+            "/new\\_conversation — clear session and start fresh\n\n"
+            "*Admin commands:*\n"
+            "/adduser <id> — approve a user\n"
+            "/removeuser <id> — revoke a user\n"
+            "/listusers — list all approved users"
+        )
+    else:
+        commands = (
+            "📸 Send a photo to start a repair diagnosis\n\n"
+            "*Commands:*\n"
+            "/help — tips for good photos\n"
+            "/history — your last 10 repairs\n"
+            "/clear\\_history — delete repair history\n"
+            "/new\\_conversation — clear session and start fresh"
+        )
     await update.message.reply_text(
         "👋 *FixBot*\n\n"
         "🇮🇱 שלחו תמונה של פריט פגום ואני אאבחן ואתן הוראות תיקון.\n"
         "🇬🇧 Send a photo of a broken item and I'll diagnose and provide repair instructions.\n\n"
-        "*/help* • */history* • */new\\_conversation*",
+        + commands,
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -215,7 +242,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "• התקרבו לאזור הבעיה\n"
             "• שלחו כמה תמונות כאלבום לבעיות מורכבות\n"
             "• הוסיפו כיתוב כמו 'דולף מלמטה' או 'משמיע רעש'\n\n"
-            "*סוגי תיקון:* מכשירי חשמל • אינסטלציה • רכב • תיקונים כלליים"
+            "*סוגי תיקון:* מכשירי חשמל • אינסטלציה • רכב • תיקונים כלליים\n\n"
+            "*פקודות:*\n"
+            "/help — טיפים לצילום\n"
+            "/history — 10 תיקונים אחרונים\n"
+            "/clear\\_history — מחיקת היסטוריה\n"
+            "/new\\_conversation — התחלה מחדש"
         )
     else:
         text = (
@@ -224,7 +256,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "• Get close to the problem area\n"
             "• Send multiple photos as an album for complex issues\n"
             "• Add a caption like 'leaking from the bottom' or 'makes a noise'\n\n"
-            "*Supported:* Appliances • Plumbing • Car mechanics • General repairs"
+            "*Supported:* Appliances • Plumbing • Car mechanics • General repairs\n\n"
+            "*Commands:*\n"
+            "/help — tips for good photos\n"
+            "/history — your last 10 repairs\n"
+            "/clear\\_history — delete repair history\n"
+            "/new\\_conversation — clear session and start fresh"
         )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -432,13 +469,16 @@ async def _run_analysis(
     _push_history(session, "assistant", analysis.get("problem_summary", ""))
     save_repair(uid, analysis)
 
-    annotated = None
-    if analysis.get("components"):
+    # Annotate each photo with its own annotations (filtered by photo index)
+    annotated_photos = []
+    if analysis.get("components") or analysis.get("areas"):
         try:
             await status_msg.edit_text(_status("marking", lang))
-            annotated = await asyncio.get_event_loop().run_in_executor(
-                None, annotate_image, image_bytes_list[0], analysis
-            )
+            for idx, img_bytes in enumerate(image_bytes_list, start=1):
+                ann = await asyncio.get_event_loop().run_in_executor(
+                    None, annotate_image, img_bytes, analysis, idx
+                )
+                annotated_photos.append(ann)
         except Exception as e:
             logger.error(f"Annotation failed: {e}", exc_info=True)
 
@@ -457,16 +497,15 @@ async def _run_analysis(
         )
     except Exception as e:
         logger.error(f"Failed to send text reply: {e}")
-        # Strip markdown and try plain text as last resort
         try:
             await update.message.reply_text(reply_text, reply_markup=keyboard)
         except Exception:
             pass
 
-    # Then send the annotated image separately (optional)
-    if annotated:
+    # Send annotated photos (one per original image)
+    for ann in annotated_photos:
         try:
-            await update.message.reply_photo(photo=annotated)
+            await update.message.reply_photo(photo=ann)
         except Exception as e:
             logger.error(f"Failed to send annotated image: {e}")
 
