@@ -529,14 +529,97 @@ def analyze_image(
 
     raw    = response.get("message", {}).get("content", "")
     parsed = _extract_json(raw)
+
+    # Retry once on parse failure — model occasionally outputs truncated JSON
     if parsed is None:
-        parsed = {
-            "problem_summary": fb["parse_error"],
-            "severity": "medium", "safety_warnings": [], "tools_needed": [],
-            "materials_needed": [], "components": [], "areas": [], "steps": [],
-            "professional_advice": raw[:400],
-        }
+        logger.warning("JSON parse failed on first attempt — retrying…")
+        time.sleep(2)
+        response2 = _call_ollama(payload)
+        raw2      = response2.get("message", {}).get("content", "")
+        parsed    = _extract_json(raw2)
+        if parsed is not None:
+            logger.info("Retry succeeded")
+        else:
+            logger.warning("Retry also failed — using fallback")
+            parsed = {
+                "problem_summary": fb["parse_error"],
+                "severity": "medium", "safety_warnings": [], "tools_needed": [],
+                "materials_needed": [], "components": [], "areas": [], "steps": [],
+                "professional_advice": raw[:400],
+            }
     return _validate(parsed, lang)
+
+
+def get_annotations_for_image(
+    image: bytes,
+    problem_summary: str,
+    lang: str = "en",
+) -> dict:
+    """
+    Separate small call to get precise component/area annotations
+    for a single image, given a known problem summary.
+    Used for multi-photo to avoid coordinate ambiguity.
+    Returns dict with 'components' and 'areas' lists.
+    """
+    resized = _resize_image(image, MAX_IMAGE_SIDE_MULTI)
+
+    if lang == "he":
+        instruction = (
+            f"הבעיה הידועה: {problem_summary}\n"
+            "סמן על התמונה הזו את האזורים והחלקים הרלוונטיים לתיקון.\n"
+            "החזר JSON עם שני שדות בלבד: components ו-areas.\n"
+            "כל הטקסט חייב להיות בעברית."
+        )
+    else:
+        instruction = (
+            f"Known problem: {problem_summary}\n"
+            "Mark the relevant parts and areas on THIS image only.\n"
+            "Return JSON with only two fields: components and areas."
+        )
+
+    schema = (
+        '{"components": [{"id": 1, "name": "part name", "point": {"x": 0-100, "y": 0-100}}], '
+        '"areas": [{"id": 1, "name": "area name", "x1": 0-100, "y1": 0-100, "x2": 0-100, "y2": 0-100}]}'
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an annotation assistant. Given an image and a known repair problem, "
+                "mark up to 4 relevant components (dots) and/or areas (boxes) on this single image. "
+                "Coordinates are percentages (0-100) of THIS image's width and height. "
+                "Use components for small specific parts, areas for zones/regions. "
+                "CRITICAL: Respond ONLY with valid JSON matching this schema: " + schema
+            ),
+        },
+        {
+            "role": "user",
+            "content": instruction,
+            "images": [_b64(resized)],
+        },
+    ]
+    payload = {
+        "model":   MODEL_NAME,
+        "messages": messages,
+        "stream":  False,
+        "options": {"temperature": 0.1, "num_predict": 800, "num_ctx": 4096},
+    }
+    for attempt in range(2):
+        try:
+            if attempt > 0:
+                time.sleep(3)  # wait before retry
+            response = _call_ollama(payload)
+            raw      = response.get("message", {}).get("content", "")
+            parsed   = _extract_json(raw)
+            if parsed and isinstance(parsed, dict):
+                return {
+                    "components": parsed.get("components", []),
+                    "areas":      parsed.get("areas", []),
+                }
+        except Exception as e:
+            logger.warning(f"get_annotations_for_image attempt {attempt+1} failed: {e}")
+    return {"components": [], "areas": []}
 
 
 def ask_followup(

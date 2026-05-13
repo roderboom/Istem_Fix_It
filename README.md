@@ -17,7 +17,7 @@ fixbot/
     ├── vision.py         — Ollama API client, prompts, JSON parsing, image resizing
     ├── annotator.py      — Draws numbered dots on images (Pillow, EXIF-aware)
     ├── history.py        — Persistent per-user repair history (JSON files)
-    └── whitelist.py      — User whitelist with admin approval flow
+    └── whitelist.py      — User whitelist, ban list, name storage, approval flow
 ```
 
 **Safe to delete:**
@@ -119,7 +119,9 @@ podman-compose logs -f fixbot
 | `/new_conversation` | Clear session and start fresh |
 | `/adduser <id>` | *(admin)* Approve a user |
 | `/removeuser <id>` | *(admin)* Revoke a user |
-| `/listusers` | *(admin)* List all approved users |
+| `/listusers` | *(admin)* List approved users with names |
+| `/ban <id>` | *(admin)* Ban a user immediately |
+| `/unban <id>` | *(admin)* Lift a ban |
 
 ---
 
@@ -132,11 +134,20 @@ FixBot uses a whitelist — only approved users can interact with it.
 **Approval flow:**
 1. A new user sends `/start`
 2. Bot tells them their request was sent, then notifies you (admin) with **✅ Allow** / **❌ Deny** buttons
-3. You tap a button — user is instantly approved or denied and notified
+3. You tap a button — user is instantly approved or denied and notified. Approved users have their name stored.
+
+**Rate limiting:**
+After 3 messages (photos + follow-ups combined), the user is blocked and you receive an alert with **✅ Allow 3 more** / **🚫 Ban** buttons. Tap to decide.
+
+**Banning:**
+- Tap **🚫 Ban** in any alert, or use `/ban <id>` directly
+- Banned users receive a one-time "You have been banned" message, then are silently ignored
+- Use `/unban <id>` to lift a ban
+- `/listusers` shows each user's ID and name
 
 **Pre-approve users** at startup via `ALLOWED_USERS=id1,id2` in `.env`.
 
-The whitelist is stored in `/data/history/whitelist.json` and survives container restarts.
+Everything is stored in `/data/history/whitelist.json` and survives container restarts.
 
 ---
 

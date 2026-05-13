@@ -249,10 +249,31 @@ The `_pending_approval` set lives in memory — it prevents duplicate admin noti
 | Command | Description |
 |---------|-------------|
 | `/adduser <id>` | Approve a user directly |
-| `/removeuser <id>` | Revoke access (cannot remove admin) |
-| `/listusers` | List all approved users |
+| `/removeuser <id>` | Revoke access |
+| `/listusers` | List approved users with stored names |
+| `/ban <id>` | Ban a user immediately |
+| `/unban <id>` | Lift a ban |
 
 All commands are gated — non-admins get a 🚫 rejection.
+
+### Rate limiting
+
+`_msg_counts: dict[int, int]` in `bot.py` tracks messages per user. After every photo or text message the counter increments. When it exceeds `MSG_LIMIT` (3), the user is blocked and the admin receives an inline alert:
+
+```
+⚠️ Usage limit reached — User: John (@john) — ID: 123456789
+[✅ Allow 3 more]  [🚫 Ban]
+```
+
+Allow 3 more resets the counter to 0. Ban calls `ban_user()` immediately. The counter is in-memory only — it resets on bot restart.
+
+### Ban list
+
+`_banned: set[int]` in `whitelist.py`. Stored under `"banned"` key in `whitelist.json`. `_ban_notified: set[int]` tracks who already received the ban message so subsequent messages are silently dropped with no response.
+
+### Name storage
+
+`_user_names: dict[int, str]` stores display names (`"Full Name (@username)"`) for approved users. Populated when admin taps Allow on an approval request (name is parsed from the approval message). Stored under `"names"` key in `whitelist.json`.
 
 ---
 
@@ -265,7 +286,8 @@ All commands are gated — non-admins get a 🚫 rejection.
 | `ALLOWED_USERS` | No | — | Comma-separated user IDs to pre-approve at startup |
 | `MODEL_NAME` | No | `gemma4:26b` | Ollama model to use |
 | `OLLAMA_HOST` | No | `http://localhost:11434` | Ollama server URL |
-| `HISTORY_DIR` | No | `/data/history` | Path for repair history and whitelist JSON files |
+| `HISTORY_DIR` | No | `/data/history` | Path for repair history, whitelist, ban list, and name storage |
+| `MSG_LIMIT` | No | `3` | Messages before admin alert (currently hardcoded, change in `bot.py`) |
 
 ---
 

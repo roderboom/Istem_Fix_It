@@ -16,6 +16,13 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 logger = logging.getLogger(__name__)
 
+try:
+    from bidi.algorithm import get_display as bidi_display
+    _BIDI = True
+except ImportError:
+    _BIDI = False
+    logger.warning('python-bidi not installed — Hebrew text may render backwards')
+
 # ── Dot style ─────────────────────────────────────────────────────────────────
 DOT_RADIUS     = 16          # base radius, scales with image size
 OUTLINE_WIDTH  = 3
@@ -51,6 +58,24 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
             except Exception:
                 continue
     return ImageFont.load_default()
+
+
+def _rtl(text: str) -> str:
+    """Fix RTL display for Hebrew/Arabic text in PIL."""
+    if _BIDI:
+        return bidi_display(text)
+    # Fallback: reverse the string so it reads correctly in LTR PIL renderer
+    return text[::-1]
+
+
+def _needs_rtl(text: str) -> bool:
+    """Return True if text contains Hebrew or Arabic characters."""
+    for ch in text:
+        if '\u0590' <= ch <= '\u05ff':  # Hebrew
+            return True
+        if '\u0600' <= ch <= '\u06ff':  # Arabic
+            return True
+    return False
 
 
 def annotate_image(image_bytes: bytes, analysis: dict, photo_index: int = 1) -> bytes:
@@ -106,7 +131,8 @@ def annotate_image(image_bytes: bytes, analysis: dict, photo_index: int = 1) -> 
                 [lx - 3, ly - 2, lx + tw + 3, ly + th + 2],
                 fill=(*color, 210),
             )
-            area_draw.text((lx, ly), label, fill=(255, 255, 255, 255), font=font)
+            display_label = _rtl(label) if _needs_rtl(label) else label
+            area_draw.text((lx, ly), display_label, fill=(255, 255, 255, 255), font=font)
 
         img = Image.alpha_composite(img, area_layer)
 

@@ -18,16 +18,24 @@ from telegram.ext import (
     filters,
 )
 
-from vision import analyze_image, ask_followup, detect_language
+from vision import analyze_image, ask_followup, detect_language, get_annotations_for_image
 import whitelist as wl
+from whitelist import is_banned, ban_user, unban_user, was_ban_notified, mark_ban_notified
 from annotator import annotate_image
 from history import save_repair, get_history_text, clear_history
 
 # Global queue — one Ollama call at a time
 # Users who sent /start and are waiting for admin approval
 _pending_approval: set[int] = set()
-APPROVE_CB = "approve"
-DENY_CB    = "deny"
+APPROVE_CB   = "approve"
+DENY_CB      = "deny"
+BAN_CB       = "ban"
+ALLOWMORE_CB = "allowmore"
+
+# Per-user message counters and pending-alert tracking
+_msg_counts:     dict[int, int]  = {}   # uid → messages since last reset
+_limit_alerted:  set[int]        = set() # uids where admin was already alerted (awaiting decision)
+MSG_LIMIT = 3
 
 _ollama_sem     = asyncio.Semaphore(1)
 _queue_waiters  = 0   # number of requests currently waiting
@@ -54,6 +62,69 @@ NEW_CONV_CB = "new_conversation"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _check_ban(update: Update) -> bool:
+    """Return True if user is banned (and handle the one-time message). Handler should return immediately if True."""
+    uid = update.effective_user.id
+    if not is_banned(uid):
+        return False
+    if not was_ban_notified(uid):
+        mark_ban_notified(uid)
+        try:
+            if update.message:
+                await update.message.reply_text("🚫 You have been banned from using this bot.")
+        except Exception:
+            pass
+    return True  # silently ignore all future messages
+
+
+async def _check_limit(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> bool:
+    """Increment message counter. If limit hit, alert admin and block. Return True if blocked."""
+    uid  = update.effective_user.id
+    if wl.is_admin(uid):
+        return False  # admin is never rate-limited
+
+    _msg_counts[uid] = _msg_counts.get(uid, 0) + 1
+    count = _msg_counts[uid]
+
+    if count <= MSG_LIMIT:
+        return False  # still within limit
+
+    # Over limit — block the message
+    if uid not in _limit_alerted and wl.ADMIN_USER_ID:
+        # First time over limit — alert admin
+        _limit_alerted.add(uid)
+        user     = update.effective_user
+        name     = user.full_name or 'Unknown'
+        username = f' (@{user.username})' if user.username else ''
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Allow 3 more", callback_data=f"{ALLOWMORE_CB}:{uid}"),
+            InlineKeyboardButton("🚫 Ban",          callback_data=f"{BAN_CB}:{uid}"),
+        ]])
+        try:
+            await context.bot.send_message(
+                chat_id=wl.ADMIN_USER_ID,
+                text=f"⚠️ *Usage limit reached*\n\n"
+                     f"User: {name}{username}\n"
+                     f"ID: `{uid}`\n"
+                     f"Messages sent: {count}\n\n"
+                     f"Allow more or ban?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.warning(f'Could not alert admin about limit: {e}')
+
+    # Tell user they're waiting for admin
+    try:
+        if update.message:
+            msg = ('⏸ הגעת למגבלת ההודעות. ממתין לאישור מנהל.' if lang == 'he'
+                   else '⏸ You have reached your message limit. Waiting for admin approval.')
+            await update.message.reply_text(msg)
+    except Exception:
+        pass
+    return True
+
 
 def _unauthorized(uid: int) -> str:
     if uid in _pending_approval:
@@ -209,7 +280,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "*Admin commands:*\n"
             "/adduser <id> — approve a user\n"
             "/removeuser <id> — revoke a user\n"
-            "/listusers — list all approved users"
+            "/listusers — list all approved users\n"
+            "/ban <id> — ban a user\n"
+            "/unban <id> — unban a user"
         )
     else:
         commands = (
@@ -220,6 +293,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/clear\\_history — delete repair history\n"
             "/new\\_conversation — clear session and start fresh"
         )
+        if wl.is_admin(uid):
+            text += (
+                "\n\n*Admin commands:*\n"
+                "/adduser <id> — approve a user\n"
+                "/removeuser <id> — revoke a user\n"
+                "/listusers — list approved users\n"
+                "/ban <id> — ban a user\n"
+                "/unban <id> — unban a user"
+            )
     await update.message.reply_text(
         "👋 *FixBot*\n\n"
         "🇮🇱 שלחו תמונה של פריט פגום ואני אאבחן ואתן הוראות תיקון.\n"
@@ -249,6 +331,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/clear\\_history — מחיקת היסטוריה\n"
             "/new\\_conversation — התחלה מחדש"
         )
+        if wl.is_admin(uid):
+            text += (
+                "\n\n*פקודות מנהל:*\n"
+                "/adduser <id> — אישור משתמש\n"
+                "/removeuser <id> — הסרת משתמש\n"
+                "/listusers — רשימת משתמשים מאושרים\n"
+                "/ban <id> — חסימת משתמש\n"
+                "/unban <id> — ביטול חסימה"
+            )
     else:
         text = (
             "💡 *Tips for best results*\n\n"
@@ -311,6 +402,53 @@ async def new_conversation_callback(update: Update, context: ContextTypes.DEFAUL
     await query.message.reply_text(_status("cleared", lang))
 
 
+# ── Ban / Allow-more callback ───────────────────────────────────────────────
+
+async def ban_allowmore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query    = update.callback_query
+    admin_id = query.from_user.id
+    await query.answer()
+
+    if not wl.is_admin(admin_id):
+        return
+
+    action, target_str = query.data.split(':', 1)
+    target = int(target_str)
+
+    if action == BAN_CB:
+        ban_user(target)
+        _limit_alerted.discard(target)
+        await query.edit_message_text(
+            f'🚫 User `{target}` has been banned.',
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            if not was_ban_notified(target):
+                mark_ban_notified(target)
+                await context.bot.send_message(
+                    chat_id=target,
+                    text='🚫 You have been banned from using this bot.',
+                )
+        except Exception as e:
+            logger.warning(f'Could not notify banned user {target}: {e}')
+
+    elif action == ALLOWMORE_CB:
+        # Reset counter so user gets MSG_LIMIT more messages
+        _msg_counts[target] = 0
+        _limit_alerted.discard(target)
+        await query.edit_message_text(
+            f'✅ User `{target}` allowed {MSG_LIMIT} more messages.',
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text=f'✅ You can send {MSG_LIMIT} more messages.',
+            )
+        except Exception as e:
+            logger.warning(f'Could not notify user {target}: {e}')
+
+
 # ── Approval callback ───────────────────────────────────────────────────────
 
 async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -325,7 +463,12 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     target = int(target_str)
 
     if action == APPROVE_CB:
-        wl.add_user(target)
+        # Recover name from the approval message text
+        msg_text = query.message.text or ""
+        import re as _re
+        name_match = _re.search(r"Name: (.+?)\n", msg_text)
+        display_name = name_match.group(1).strip() if name_match else ""
+        wl.add_user(target, display_name)
         _pending_approval.discard(target)
         # Edit the admin message to confirm
         await query.edit_message_text(
@@ -398,6 +541,49 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"ℹ️ User {target} was not in the list.")
 
 
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if not wl.is_admin(uid):
+        await update.message.reply_text('🚫 Admin only.')
+        return
+    if not context.args:
+        await update.message.reply_text('Usage: /ban <user_id>')
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text('Invalid user ID.')
+        return
+    if ban_user(target):
+        await update.message.reply_text(f'🚫 User {target} banned.')
+    else:
+        await update.message.reply_text(f'ℹ️ User {target} is already banned or is the admin.')
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if not wl.is_admin(uid):
+        await update.message.reply_text('🚫 Admin only.')
+        return
+    if not context.args:
+        await update.message.reply_text('Usage: /unban <user_id>')
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text('Invalid user ID.')
+        return
+    if unban_user(target):
+        await update.message.reply_text(f'✅ User {target} unbanned.')
+        try:
+            await context.bot.send_message(chat_id=target,
+                text='✅ Your ban has been lifted. You can use the bot again.')
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text(f'ℹ️ User {target} was not banned.')
+
+
 async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     if not wl.is_admin(uid):
@@ -408,9 +594,10 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("No users in whitelist.")
         return
     lines = [f"👥 *Allowed users* ({len(users)}):"]
-    for u in users:
-        tag = " _(admin)_" if u == wl.ADMIN_USER_ID else ""
-        lines.append(f"• `{u}`{tag}")
+    for uid_entry, display_name in users:
+        tag  = " _(admin)_" if uid_entry == wl.ADMIN_USER_ID else ""
+        name = f" — {display_name}" if display_name else ""
+        lines.append(f"• `{uid_entry}`{name}{tag}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -428,38 +615,33 @@ async def _run_analysis(
 
     global _queue_waiters
 
-    # Show queue position if others are waiting
-    if _ollama_sem.locked():
-        _queue_waiters += 1
-        pos = _queue_waiters
-        queue_msg = ("⏳ בתור לעיבוד..." if lang == "he" else f"⏳ In queue, please wait...")
+    # Counter-based queue: increment before acquiring, so others can see how many are waiting
+    _queue_waiters += 1
+    position = _queue_waiters
+
+    if position > 1:
+        # Someone else is already processing — show queue position
+        if lang == "he":
+            queue_msg = f"⏳ אתה מספר {position} בתור. ממתין…"
+        else:
+            queue_msg = f"⏳ You are #{position} in queue. Please wait…"
         status_msg = await update.message.reply_text(queue_msg)
-        async with _ollama_sem:
-            _queue_waiters -= 1
-            await status_msg.edit_text(_status("analyzing", lang))
-            try:
-                await status_msg.edit_text(_status("diagnosing", lang))
-                analysis = await asyncio.get_event_loop().run_in_executor(
-                    None, analyze_image, image_bytes_list, caption, session["history"], lang
-                )
-            except Exception as e:
-                logger.error(f"Vision analysis failed: {e}")
-                await status_msg.edit_text(_status("model_error", lang) + f"\n`{str(e)[:150]}`",
-                                           parse_mode=ParseMode.MARKDOWN)
-                return
     else:
         status_msg = await update.message.reply_text(_status("analyzing", lang))
-        async with _ollama_sem:
-            try:
-                await status_msg.edit_text(_status("diagnosing", lang))
-                analysis = await asyncio.get_event_loop().run_in_executor(
-                    None, analyze_image, image_bytes_list, caption, session["history"], lang
-                )
-            except Exception as e:
-                logger.error(f"Vision analysis failed: {e}")
-                await status_msg.edit_text(_status("model_error", lang) + f"\n`{str(e)[:150]}`",
-                                           parse_mode=ParseMode.MARKDOWN)
-                return
+
+    async with _ollama_sem:
+        _queue_waiters -= 1
+        try:
+            await status_msg.edit_text(_status("diagnosing", lang))
+            analysis = await asyncio.get_event_loop().run_in_executor(
+                None, analyze_image, image_bytes_list, caption, session["history"], lang
+            )
+        except Exception as e:
+            logger.error(f"Vision analysis failed: {e}")
+            await status_msg.edit_text(_status("model_error", lang) + f"\n`{str(e)[:150]}`",
+                                       parse_mode=ParseMode.MARKDOWN)
+            _queue_waiters = max(0, _queue_waiters)
+            return
 
 
 
@@ -469,16 +651,38 @@ async def _run_analysis(
     _push_history(session, "assistant", analysis.get("problem_summary", ""))
     save_repair(uid, analysis)
 
-    # Annotate each photo with its own annotations (filtered by photo index)
+    # Annotate each photo
+    # Single photo: use analysis components/areas directly
+    # Multi-photo: run a separate small annotation call per image for precise coordinates
     annotated_photos = []
     if analysis.get("components") or analysis.get("areas"):
         try:
             await status_msg.edit_text(_status("marking", lang))
-            for idx, img_bytes in enumerate(image_bytes_list, start=1):
+        except Exception:
+            pass  # status update is cosmetic — never block annotation on it
+        try:
+            if len(image_bytes_list) == 1:
+                # Single image — use analysis annotations directly
                 ann = await asyncio.get_event_loop().run_in_executor(
-                    None, annotate_image, img_bytes, analysis, idx
+                    None, annotate_image, image_bytes_list[0], analysis, 1
                 )
                 annotated_photos.append(ann)
+            else:
+                # Multiple images — brief pause so Ollama frees its connection,
+                # then get fresh per-image coordinates for each photo
+                await asyncio.sleep(1.5)
+                problem = analysis.get("problem_summary", "")
+                for idx, img_bytes in enumerate(image_bytes_list, start=1):
+                    per_img = await asyncio.get_event_loop().run_in_executor(
+                        None, get_annotations_for_image, img_bytes, problem, lang
+                    )
+                    img_analysis = dict(analysis)
+                    img_analysis["components"] = per_img["components"]
+                    img_analysis["areas"]      = per_img["areas"]
+                    ann = await asyncio.get_event_loop().run_in_executor(
+                        None, annotate_image, img_bytes, img_analysis, 1
+                    )
+                    annotated_photos.append(ann)
         except Exception as e:
             logger.error(f"Annotation failed: {e}", exc_info=True)
 
@@ -538,10 +742,12 @@ async def _flush_album(
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid     = update.effective_user.id
+    if await _check_ban(update): return
     if not wl.is_allowed(uid):
         await update.message.reply_text(_unauthorized(uid))
         return
     session = user_sessions[uid]
+    if await _check_limit(update, context, session['lang']): return
 
     # Detect language from caption if present
     caption = update.message.caption or ""
@@ -583,10 +789,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid      = update.effective_user.id
+    if await _check_ban(update): return
     if not wl.is_allowed(uid):
         await update.message.reply_text(_unauthorized(uid))
         return
     session  = user_sessions[uid]
+    if await _check_limit(update, context, session['lang']): return
     question = update.message.text.strip()
 
     # Update language from whatever the user just typed
@@ -636,6 +844,10 @@ def main() -> None:
     app.add_handler(CommandHandler("adduser",          adduser_command))
     app.add_handler(CommandHandler("removeuser",       removeuser_command))
     app.add_handler(CommandHandler("listusers",        listusers_command))
+    app.add_handler(CommandHandler("ban",              ban_command))
+    app.add_handler(CommandHandler("unban",            unban_command))
+    app.add_handler(CallbackQueryHandler(ban_allowmore_callback,
+                    pattern=f'^({BAN_CB}|{ALLOWMORE_CB}):'))
     app.add_handler(CallbackQueryHandler(new_conversation_callback, pattern=f"^{NEW_CONV_CB}$"))
     app.add_handler(CallbackQueryHandler(approval_callback, pattern=f"^({APPROVE_CB}|{DENY_CB}):"))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
